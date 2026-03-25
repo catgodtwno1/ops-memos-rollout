@@ -309,6 +309,84 @@ CREATE CONSTRAINT memory_id_unique IF NOT EXISTS FOR (n:Memory) REQUIRE n.id IS 
 
 **Fix:** Always use the correct message format (see "Critical: API Format" above).
 
+## Data Migration (跨機器遷移)
+
+### When to migrate
+
+- Moving from local Docker to NAS
+- Consolidating multiple machines' memory into one server
+- Disaster recovery from backup
+
+### Migration script
+
+```bash
+# Full migration: local Mac → NAS (with dedup)
+python3 scripts/memos_migrate.py \
+  --src http://127.0.0.1 \
+  --dst http://10.10.10.66 \
+  --src-neo4j-auth neo4j:12345678 \
+  --dst-neo4j-auth neo4j:openclaw2026
+
+# Dry run first (count only, no writes)
+python3 scripts/memos_migrate.py \
+  --src http://127.0.0.1 \
+  --dst http://10.10.10.66 \
+  --dry-run
+
+# Skip Qdrant (only migrate Neo4j nodes)
+python3 scripts/memos_migrate.py \
+  --src http://127.0.0.1 \
+  --dst http://10.10.10.66 \
+  --skip-qdrant
+
+# Custom ports
+python3 scripts/memos_migrate.py \
+  --src http://192.168.1.100 \
+  --dst http://192.168.1.200 \
+  --src-neo4j-port 7474 --dst-neo4j-port 7474 \
+  --src-qdrant-port 6333 --dst-qdrant-port 6333
+```
+
+### What it migrates
+
+| Phase | Data | Method | Dedup |
+|-------|------|--------|-------|
+| 1 | Qdrant vectors | Scroll API → Upsert | By point UUID |
+| 2 | Neo4j Memory nodes | HTTP API + parameterized UNWIND | By node ID |
+| 3 | Fix stringified lists | Auto-repair imported nodes | — |
+
+### Known pitfalls
+
+1. **List fields become strings**: Neo4j HTTP API imports `[]` as `"[]"` (string). Phase 3 auto-fixes this. Without the fix, MemOS Pydantic validation fails and search returns empty results.
+
+2. **Don't use cypher-shell for import**: Multi-language text (Chinese, apostrophes, etc.) breaks cypher string escaping. Always use HTTP API with parameterized queries.
+
+3. **NAS /tmp is tiny**: QNAP `/tmp` is a 64MB tmpfs. Don't try to export snapshots there. Use rsync or HTTP API streaming.
+
+4. **Restart MemOS after migration**: The API caches some state. Always restart the API container after migration to pick up new data.
+
+5. **Concurrent writes during migration**: Don't run MemOS writes from other clients during migration — Neo4j transaction conflicts can cause timeout cascades.
+
+### Prerequisites
+
+- Both Neo4j instances must have HTTP API enabled (port 7474 by default)
+- Both Qdrant instances must be accessible (port 6333)
+- Python 3 (stdlib only, no pip install needed)
+- Network connectivity between source and destination
+
+### Post-migration verification
+
+```bash
+# Restart destination MemOS API
+docker restart <memos-api-container>
+
+# Run smoke test against destination
+python3 scripts/memos_client_smoke_test.py --base-url http://DEST_IP:8765 --user-id openclaw
+
+# Run stress test to confirm stability
+python3 scripts/memos_stress_test.py --url http://DEST_IP:8765 --rounds 100
+```
+
 ## Scripts
 
 | Script | Purpose |
@@ -321,3 +399,4 @@ CREATE CONSTRAINT memory_id_unique IF NOT EXISTS FOR (n:Memory) REQUIRE n.id IS 
 | `scripts/memos_client_smoke_test.py` | Real add+search validation |
 | `scripts/onboard_memos_client.sh` | One-command client onboard |
 | `scripts/memos_stress_test.py` | 500 輪壓測（驗證 O(N) patch） |
+| `scripts/memos_migrate.py` | 跨機器數據遷移（Qdrant + Neo4j，自動去重） |
